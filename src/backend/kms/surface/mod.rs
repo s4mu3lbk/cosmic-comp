@@ -67,7 +67,7 @@ use smithay::{
             channel::{Event, Sender, channel},
             timer::{TimeoutAction, Timer},
         },
-        drm::control::{connector, crtc},
+        drm::control::{Device as ControlDevice, connector, crtc},
         wayland_protocols::wp::{
             linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1,
             presentation_time::server::wp_presentation_feedback,
@@ -102,6 +102,9 @@ use std::{
 
 mod timings;
 pub use self::timings::Timings;
+
+/// Gamma ramps (red, green, blue) applied to an output's crtc.
+pub type GammaRamps = (Vec<u16>, Vec<u16>, Vec<u16>);
 
 use super::{drm_helpers, render::gles::GbmGlowBackend};
 
@@ -142,6 +145,7 @@ pub struct SurfaceThreadState {
     timings: Timings,
     frame_callback_seq: usize,
     thread_sender: Sender<SurfaceCommand>,
+    gamma: Option<GammaRamps>,
 
     output: Output,
     mirroring: Option<Output>,
@@ -214,6 +218,7 @@ pub enum ThreadCommand {
     },
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
+    SetGamma(Option<GammaRamps>),
     VBlank(Option<DrmEventMetadata>),
     ScheduleRender,
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
@@ -451,6 +456,14 @@ impl Surface {
         self.dpms
     }
 
+    pub fn crtc(&self) -> crtc::Handle {
+        self.crtc
+    }
+
+    pub fn set_gamma(&mut self, ramps: Option<GammaRamps>) {
+        let _ = self.thread_command.send(ThreadCommand::SetGamma(ramps));
+    }
+
     pub fn set_dpms(&mut self, on: bool) {
         if self.dpms != on {
             self.dpms = on;
@@ -541,6 +554,7 @@ fn surface_thread(
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
         thread_sender,
+        gamma: None,
 
         output,
         mirroring: None,
@@ -599,6 +613,10 @@ fn surface_thread(
             }
             Event::Msg(ThreadCommand::UpdateScreenFilter(filter_config)) => {
                 state.update_screen_filter(filter_config);
+            }
+            Event::Msg(ThreadCommand::SetGamma(ramps)) => {
+                state.gamma = ramps;
+                state.apply_gamma();
             }
             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
                 if let Some(compositor) = state.compositor.as_mut() {
@@ -666,6 +684,48 @@ fn surface_thread(
 }
 
 impl SurfaceThreadState {
+    /// Apply the currently configured gamma ramps to the crtc, or restore the
+    /// original gamma tables if none are set.
+    fn apply_gamma(&mut self) {
+        let Some(compositor) = self.compositor.as_ref() else {
+            return;
+        };
+
+        compositor.with_compositor(|c| {
+            let surface = c.surface();
+            let crtc = compositor.crtc();
+
+            match &self.gamma {
+                Some((red, green, blue)) => {
+                    if let Err(err) = surface.set_gamma(crtc, red, green, blue) {
+                        warn!(?err, "Failed to set gamma ramps");
+                    }
+                }
+                None => match surface.get_crtc(crtc) {
+                    Ok(crtc_info) => {
+                        let size = crtc_info.gamma_length() as usize;
+                        if size == 0 {
+                            return;
+                        }
+
+                        // Identity ramp: evenly spaced values from 0 to u16::MAX.
+                        let ramp: Vec<u16> = if size == 1 {
+                            vec![u16::MAX]
+                        } else {
+                            (0..size)
+                                .map(|i| (i * u16::MAX as usize / (size - 1)) as u16)
+                                .collect()
+                        };
+                        if let Err(err) = surface.set_gamma(crtc, &ramp, &ramp, &ramp) {
+                            warn!(?err, "Failed to reset gamma ramps");
+                        }
+                    }
+                    Err(err) => warn!(?err, "Failed to query crtc gamma length"),
+                },
+            }
+        });
+    }
+
     fn suspend(&mut self, tx: SyncSender<()>) {
         self.active.store(false, Ordering::SeqCst);
         let _ = self.compositor.take();
@@ -720,6 +780,7 @@ impl SurfaceThreadState {
                 .remove(FrameFlags::ALLOW_OVERLAY_PLANE_SCANOUT);
         }
         self.compositor = Some(compositor);
+        self.apply_gamma();
     }
 
     fn node_added(
