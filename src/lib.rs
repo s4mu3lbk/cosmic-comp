@@ -45,6 +45,7 @@ pub mod hooks;
 pub mod input;
 pub mod libei;
 mod logger;
+pub mod night_light;
 pub mod session;
 pub mod shell;
 pub mod state;

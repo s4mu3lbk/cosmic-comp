@@ -93,7 +93,7 @@ use std::{
     mem,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
@@ -145,7 +145,11 @@ pub struct SurfaceThreadState {
     timings: Timings,
     frame_callback_seq: usize,
     thread_sender: Sender<SurfaceCommand>,
-    gamma: Option<GammaRamps>,
+    /// Gamma ramps set by an external `wlr-gamma-control` client. Always win
+    /// over the internal night light.
+    external_gamma: Option<GammaRamps>,
+    /// Internal night light color temperature in Kelvin (`None` = off).
+    night_light: Option<f32>,
 
     output: Output,
     mirroring: Option<Output>,
@@ -219,6 +223,9 @@ pub enum ThreadCommand {
     UpdateMirroring(Option<Output>),
     UpdateScreenFilter(ScreenFilter),
     SetGamma(Option<GammaRamps>),
+    /// Update the internal night light color temperature in Kelvin (`None` = off).
+    /// External `SetGamma` ramps always take precedence over the night light.
+    SetNightLight(Option<f32>),
     VBlank(Option<DrmEventMetadata>),
     ScheduleRender,
     AdaptiveSyncAvailable(SyncSender<Result<VrrSupport>>),
@@ -254,6 +261,7 @@ impl Surface {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        night_light_current: Arc<AtomicU64>,
     ) -> Result<Self> {
         let (tx, rx) = channel::<ThreadCommand>();
         let (tx2, rx2) = channel::<SurfaceCommand>();
@@ -275,6 +283,7 @@ impl Surface {
                     tx2,
                     rx,
                     startup_done,
+                    night_light_current,
                 ) {
                     error!("Surface thread crashed: {}", err);
                 }
@@ -464,6 +473,12 @@ impl Surface {
         let _ = self.thread_command.send(ThreadCommand::SetGamma(ramps));
     }
 
+    pub fn set_night_light(&mut self, temperature: Option<f32>) {
+        let _ = self
+            .thread_command
+            .send(ThreadCommand::SetNightLight(temperature));
+    }
+
     pub fn set_dpms(&mut self, on: bool) {
         if self.dpms != on {
             self.dpms = on;
@@ -512,6 +527,7 @@ fn surface_thread(
     thread_sender: Sender<SurfaceCommand>,
     thread_receiver: Channel<ThreadCommand>,
     startup_done: Arc<AtomicBool>,
+    night_light_current: Arc<AtomicU64>,
 ) -> Result<()> {
     let name = output.name();
     profiling::register_thread!(&format!("Surface Thread {}", name));
@@ -554,7 +570,17 @@ fn surface_thread(
         timings: Timings::new(None, None, false, target_node),
         frame_callback_seq: 0,
         thread_sender,
-        gamma: None,
+        external_gamma: None,
+        night_light: {
+            // Initialize from the compositor's currently applied temperature
+            // (0 = off), so surfaces created later (e.g. hot-plug) match.
+            let bits = night_light_current.load(Ordering::SeqCst);
+            if bits == 0 {
+                None
+            } else {
+                Some(f32::from_bits(bits as u32))
+            }
+        },
 
         output,
         mirroring: None,
@@ -615,7 +641,11 @@ fn surface_thread(
                 state.update_screen_filter(filter_config);
             }
             Event::Msg(ThreadCommand::SetGamma(ramps)) => {
-                state.gamma = ramps;
+                state.external_gamma = ramps;
+                state.apply_gamma();
+            }
+            Event::Msg(ThreadCommand::SetNightLight(temperature)) => {
+                state.night_light = temperature;
                 state.apply_gamma();
             }
             Event::Msg(ThreadCommand::AdaptiveSyncAvailable(result)) => {
@@ -684,8 +714,11 @@ fn surface_thread(
 }
 
 impl SurfaceThreadState {
-    /// Apply the currently configured gamma ramps to the crtc, or restore the
-    /// original gamma tables if none are set.
+    /// Apply the currently configured gamma ramps to the crtc.
+    ///
+    /// Priority: gamma ramps from an external `wlr-gamma-control` client win
+    /// over the internal night light; when neither is set, the original
+    /// identity gamma tables are restored.
     fn apply_gamma(&mut self) {
         let Some(compositor) = self.compositor.as_ref() else {
             return;
@@ -695,33 +728,51 @@ impl SurfaceThreadState {
             let surface = c.surface();
             let crtc = compositor.crtc();
 
-            match &self.gamma {
-                Some((red, green, blue)) => {
-                    if let Err(err) = surface.set_gamma(crtc, red, green, blue) {
-                        warn!(?err, "Failed to set gamma ramps");
-                    }
-                }
-                None => match surface.get_crtc(crtc) {
-                    Ok(crtc_info) => {
-                        let size = crtc_info.gamma_length() as usize;
-                        if size == 0 {
-                            return;
-                        }
+            enum Plan<'a> {
+                Ramps(&'a (Vec<u16>, Vec<u16>, Vec<u16>)),
+                Temperature(f32),
+                Identity,
+            }
 
-                        // Identity ramp: evenly spaced values from 0 to u16::MAX.
-                        let ramp: Vec<u16> = if size == 1 {
-                            vec![u16::MAX]
-                        } else {
-                            (0..size)
-                                .map(|i| (i * u16::MAX as usize / (size - 1)) as u16)
-                                .collect()
-                        };
-                        if let Err(err) = surface.set_gamma(crtc, &ramp, &ramp, &ramp) {
-                            warn!(?err, "Failed to reset gamma ramps");
-                        }
-                    }
-                    Err(err) => warn!(?err, "Failed to query crtc gamma length"),
-                },
+            let plan = if let Some(ramps) = self.external_gamma.as_ref() {
+                Plan::Ramps(ramps)
+            } else if let Some(temperature) = self.night_light {
+                Plan::Temperature(temperature)
+            } else {
+                Plan::Identity
+            };
+
+            let size = match surface.get_crtc(crtc) {
+                Ok(crtc_info) => crtc_info.gamma_length() as usize,
+                Err(err) => {
+                    warn!(?err, "Failed to query crtc gamma length");
+                    return;
+                }
+            };
+            if size == 0 {
+                return;
+            }
+
+            let (red, green, blue) = match plan {
+                Plan::Ramps(ramps) => ramps.clone(),
+                Plan::Temperature(temperature) => {
+                    crate::night_light::temperature_to_ramps(temperature, size)
+                }
+                Plan::Identity => {
+                    // Identity ramp: evenly spaced values from 0 to u16::MAX.
+                    let ramp: Vec<u16> = if size == 1 {
+                        vec![u16::MAX]
+                    } else {
+                        (0..size)
+                            .map(|i| (i * u16::MAX as usize / (size - 1)) as u16)
+                            .collect()
+                    };
+                    (ramp.clone(), ramp.clone(), ramp)
+                }
+            };
+
+            if let Err(err) = surface.set_gamma(crtc, &red, &green, &blue) {
+                warn!(?err, "Failed to set gamma ramps");
             }
         });
     }
