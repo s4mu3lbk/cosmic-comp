@@ -55,7 +55,7 @@ use std::{
     fmt,
     os::fd::OwnedFd,
     path::Path,
-    sync::{Arc, RwLock, atomic::AtomicBool, mpsc::Receiver},
+    sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64}, mpsc::Receiver},
     time::Duration,
 };
 
@@ -260,6 +260,7 @@ impl State {
                     self.common.config.dynamic_conf.screen_filter().clone(),
                     self.common.shell.clone(),
                     self.common.startup_done.clone(),
+                    self.backend.kms().night_light_current.clone(),
                 ) {
                     Ok((output, should_expose)) => {
                         if should_expose {
@@ -347,6 +348,7 @@ impl State {
                         self.common.config.dynamic_conf.screen_filter().clone(),
                         self.common.shell.clone(),
                         self.common.startup_done.clone(),
+                        backend.night_light_current.clone(),
                     ) {
                         Ok((output, should_expose)) => {
                             if should_expose {
@@ -519,6 +521,7 @@ impl State {
                                     self.common.config.dynamic_conf.screen_filter().clone(),
                                     self.common.shell.clone(),
                                     self.common.startup_done.clone(),
+                                    self.common.night_light_current.clone(),
                                 ) {
                                     Ok(data) => {
                                         new_device.inner.surfaces.insert(crtc, data);
@@ -554,6 +557,7 @@ impl State {
                             self.common.config.dynamic_conf.screen_filter().clone(),
                             self.common.shell.clone(),
                             self.common.startup_done.clone(),
+                            backend.night_light_current.clone(),
                         ) {
                             Ok((output, should_expose)) => {
                                 if should_expose {
@@ -1007,6 +1011,7 @@ impl InnerDevice {
         screen_filter: ScreenFilter,
         shell: Arc<parking_lot::RwLock<Shell>>,
         startup_done: Arc<AtomicBool>,
+        night_light_current: Arc<AtomicU64>,
     ) -> Result<(Output, bool)> {
         let output = self
             .outputs
@@ -1070,6 +1075,7 @@ impl InnerDevice {
                     screen_filter,
                     shell,
                     startup_done,
+                    night_light_current.clone(),
                 ) {
                     Ok(data) => {
                         self.surfaces.insert(crtc, data);

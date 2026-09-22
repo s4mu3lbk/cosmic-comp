@@ -315,6 +315,34 @@ impl Config {
             ),
         };
 
+        // Listen for updates to the night light config (com.system76.CosmicSettings.NightLight).
+        match cosmic_settings_config::night_light::context() {
+            Ok(night_light_context) => {
+                match cosmic_config::calloop::ConfigWatchSource::new(&night_light_context) {
+                    Ok(source) => {
+                        if let Err(err) =
+                            loop_handle.insert_source(source, |(config, _keys), (), state| {
+                                state.common.night_light_config =
+                                    cosmic_settings_config::night_light::Config::get_entry(&config)
+                                        .unwrap_or_else(|(_, c)| c);
+                                state.update_night_light();
+                            })
+                        {
+                            warn!(
+                                ?err,
+                                "Failed to watch com.system76.CosmicSettings.NightLight config"
+                            );
+                        }
+                    }
+                    Err(err) => warn!(
+                        ?err,
+                        "failed to create config watch source for com.system76.CosmicSettings.NightLight"
+                    ),
+                }
+            }
+            Err(err) => warn!(?err, "failed to load com.system76.CosmicSettings.NightLight config"),
+        };
+
         let _ = loop_handle.insert_idle(|state| {
             let filter_conf = state.common.config.dynamic_conf.screen_filter();
             state

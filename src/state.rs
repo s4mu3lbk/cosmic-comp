@@ -33,8 +33,10 @@ use crate::{
     xwayland::XWaylandState,
 };
 use anyhow::Context;
-use calloop::RegistrationToken;
+use calloop::timer::{TimeoutAction, Timer};
+use calloop::{RegistrationToken, channel};
 use cosmic_comp_config::output::comp::{OutputConfig, OutputState};
+use cosmic_config::CosmicConfigEntry;
 use i18n_embed::{
     DesktopLanguageRequester,
     fluent::{FluentLanguageLoader, fluent_language_loader},
@@ -130,7 +132,10 @@ use std::{
     collections::HashSet,
     ffi::OsString,
     process::{Child, Command},
-    sync::{Arc, LazyLock, Once, atomic::AtomicBool},
+    sync::{
+        Arc, LazyLock, Once,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -329,6 +334,16 @@ pub struct Common {
     pub inhibit_lid_fd: Option<OwnedFd>,
 
     pub with_xwayland: bool,
+
+    // Night light state (config: com.system76.CosmicSettings.NightLight)
+    pub night_light_config: cosmic_settings_config::night_light::Config,
+    pub night_light_location: Option<(f64, f64)>,
+    pub night_light_location_requested: bool,
+    /// Currently applied temperature in Kelvin (0 = off), for newly-created surfaces.
+    pub night_light_current: Arc<AtomicU64>,
+    pub night_light_timer: Option<RegistrationToken>,
+    /// Delivers GeoClue location results from the helper thread.
+    pub night_light_location_sender: channel::Sender<Option<(f64, f64)>>,
 }
 
 #[derive(Debug)]
@@ -670,6 +685,25 @@ impl State {
 
         let clock = Clock::new();
         let config = Config::load(&handle);
+
+        // Night light state (config lives in cosmic-settings-config).
+        let night_light_config = cosmic_settings_config::night_light::context()
+            .map(|ctx| {
+                cosmic_settings_config::night_light::Config::get_entry(&ctx)
+                    .unwrap_or_else(|(_, c)| c)
+            })
+            .unwrap_or_default();
+        let (night_light_location_sender, night_light_location_receiver) =
+            channel::channel::<Option<(f64, f64)>>();
+        handle
+            .insert_source(night_light_location_receiver, |msg, (), state| {
+                if let channel::Event::Msg(location) = msg {
+                    state.common.night_light_location = location;
+                    state.update_night_light();
+                }
+            })
+            .expect("Failed to add night light location channel to the event loop");
+
         let compositor_state = CompositorState::new::<Self>(dh);
         let corner_radius_state = CornerRadiusState::new::<Self>(dh);
         let data_device_state = DataDeviceState::new::<Self>(dh);
@@ -771,7 +805,7 @@ impl State {
         let session_lock_layer_state =
             SessionLockLayerState::new::<State, _>(dh, client_not_sandboxed);
 
-        State {
+        let mut state = State {
             common: Common {
                 config,
                 socket,
@@ -845,11 +879,77 @@ impl State {
                 inhibit_lid_fd: None,
 
                 with_xwayland,
+
+                night_light_config,
+                night_light_location: None,
+                night_light_location_requested: false,
+                night_light_current: Arc::new(AtomicU64::new(0)),
+                night_light_timer: None,
+                night_light_location_sender,
             },
             backend: BackendData::Unset,
             ready: Once::new(),
             last_refresh: LastRefresh::None,
             kiosk_command,
+        };
+
+        state.update_night_light();
+        state
+    }
+
+    /// Re-evaluate the night light state and apply it to all outputs.
+    ///
+    /// Applies the currently active color temperature to every KMS surface
+    /// (unless an external `wlr-gamma-control` client is active, which always
+    /// wins), publishes the temperature for surfaces created later, and
+    /// (re)schedules the timer for the next schedule transition.
+    pub fn update_night_light(&mut self) {
+        let config = &self.common.night_light_config;
+
+        // Request the location once on a helper thread (GeoClue is blocking).
+        if config.auto_schedule && !self.common.night_light_location_requested {
+            self.common.night_light_location_requested = true;
+            let sender = self.common.night_light_location_sender.clone();
+            std::thread::spawn(move || {
+                let _ = sender.send(crate::night_light::query_location());
+            });
+        }
+
+        let temp = crate::night_light::active_temperature(config, self.common.night_light_location);
+        self.common.night_light_current.store(
+            temp.map(|t| u64::from(t.to_bits())).unwrap_or(0),
+            Ordering::SeqCst,
+        );
+
+        if let BackendData::Kms(kms_state) = &mut self.backend {
+            for device in kms_state.drm_devices.values_mut() {
+                for surface in device.inner.surfaces.values_mut() {
+                    surface.set_night_light(temp);
+                }
+            }
+        }
+
+        // (Re)schedule the timer for the next schedule transition.
+        if let Some(token) = self.common.night_light_timer.take() {
+            let _ = self.common.event_loop_handle.remove(token);
+        }
+        if let Some(duration) =
+            crate::night_light::next_transition(config, self.common.night_light_location)
+        {
+            let handle = self.common.event_loop_handle.clone();
+            match handle.insert_source(Timer::from_duration(duration), |_, _, state| {
+                state.update_night_light();
+                TimeoutAction::ToDuration(
+                    crate::night_light::next_transition(
+                        &state.common.night_light_config,
+                        state.common.night_light_location,
+                    )
+                    .unwrap_or(Duration::from_secs(6 * 3600)),
+                )
+            }) {
+                Ok(token) => self.common.night_light_timer = Some(token),
+                Err(err) => warn!(?err, "failed to schedule night light timer"),
+            }
         }
     }
 

@@ -55,7 +55,7 @@ use tracing::{debug, error, info, warn};
 use std::{
     collections::{HashMap, HashSet},
     path::Path,
-    sync::{Arc, RwLock, atomic::AtomicBool},
+    sync::{Arc, RwLock, atomic::{AtomicBool, AtomicU64}},
     time::Duration,
 };
 
@@ -83,11 +83,16 @@ pub struct KmsState {
 
     pub syncobj_state: Option<DrmSyncobjState>,
     pub dmabuf_global: Option<DmabufGlobal>,
+
+    /// Currently applied night light temperature in Kelvin (0 = off), shared
+    /// with newly-created surfaces so they initialize to the same state.
+    pub night_light_current: Arc<AtomicU64>,
 }
 
 pub struct KmsGuard<'a> {
     pub drm_devices: IndexMap<DrmNode, LockedDevice<'a>>,
     pub primary_node: Arc<RwLock<Option<DrmNode>>>,
+    pub night_light_current: Arc<AtomicU64>,
     api: &'a mut GpuManager<GbmGlowBackend<DrmDeviceFd>>,
     session: &'a LibSeatSession,
 }
@@ -141,6 +146,8 @@ pub fn init_backend(
 
         syncobj_state: None,
         dmabuf_global: None,
+
+        night_light_current: state.common.night_light_current.clone(),
     });
 
     // manually add already present gpus
@@ -806,6 +813,7 @@ impl KmsState {
                 .map(|(node, device)| (*node, device.lock()))
                 .collect(),
             primary_node: self.primary_node.clone(),
+            night_light_current: self.night_light_current.clone(),
             api: &mut self.api,
             session: &self.session,
         }
@@ -1007,6 +1015,7 @@ impl KmsGuard<'_> {
                         screen_filter.clone(),
                         shell.clone(),
                         startup_done.clone(),
+                        self.night_light_current.clone(),
                     )?;
                     if output.mirroring().is_none() {
                         w += output.geometry().size.w as u32;
