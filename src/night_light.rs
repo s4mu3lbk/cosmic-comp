@@ -207,6 +207,9 @@ pub fn active_temperature(config: &Config, location: Option<(f64, f64)>) -> Opti
     if !config.enabled {
         return None;
     }
+    if config.always_on {
+        return Some(config.temperature);
+    }
 
     let (_, now) = day_and_minutes();
     let active = if config.auto_schedule {
@@ -238,6 +241,9 @@ pub fn active_temperature(config: &Config, location: Option<(f64, f64)>) -> Opti
 /// configured boundary even when nothing else changes.
 pub fn next_transition(config: &Config, location: Option<(f64, f64)>) -> Option<std::time::Duration> {
     if !config.enabled {
+        return None;
+    }
+    if config.always_on {
         return None;
     }
 
@@ -354,4 +360,60 @@ pub fn query_location() -> Option<(f64, f64)> {
 
     let _: Result<(), _> = client.call("Stop", &());
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic_settings_config::night_light::Config;
+
+    #[test]
+    fn always_on_applies_temperature_at_any_time() {
+        let mut config = Config {
+            enabled: true,
+            always_on: true,
+            auto_schedule: true,
+            ..Default::default()
+        };
+
+        // Regardless of the schedule mode or location, always-on must be
+        // active at any time of day.
+        for location in [None, Some((52.5, 13.4))] {
+            assert_eq!(
+                active_temperature(&config, location),
+                Some(config.temperature)
+            );
+        }
+
+        config.auto_schedule = false;
+        for location in [None, Some((52.5, 13.4))] {
+            assert_eq!(
+                active_temperature(&config, location),
+                Some(config.temperature)
+            );
+        }
+    }
+
+    #[test]
+    fn always_on_still_requires_master_toggle() {
+        let config = Config {
+            enabled: false,
+            always_on: true,
+            ..Default::default()
+        };
+
+        assert_eq!(active_temperature(&config, None), None);
+        assert_eq!(next_transition(&config, None), None);
+    }
+
+    #[test]
+    fn always_on_needs_no_transition_timer() {
+        let config = Config {
+            enabled: true,
+            always_on: true,
+            ..Default::default()
+        };
+
+        assert_eq!(next_transition(&config, None), None);
+    }
 }
