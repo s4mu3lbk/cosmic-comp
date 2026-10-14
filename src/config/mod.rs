@@ -72,6 +72,8 @@ pub struct Config {
     pub shortcuts: Shortcuts,
     // Tiling exceptions from `com.system76.CosmicSettings.WindowRules`
     pub tiling_exceptions: Vec<ApplicationException>,
+    // Active hint exceptions from `com.system76.CosmicSettings.WindowRules`
+    pub hint_exceptions: Vec<ApplicationException>,
     /// System actions from `com.system76.CosmicSettings.Shortcuts`
     pub system_actions: BTreeMap<shortcuts::action::System, String>,
 }
@@ -306,6 +308,7 @@ impl Config {
         let window_rules_context =
             window_rules::context().expect("Failed to load window rules config");
         let tiling_exceptions = window_rules::tiling_exceptions(&window_rules_context);
+        let hint_exceptions = window_rules::hint_exceptions(&window_rules_context);
 
         match cosmic_config::calloop::ConfigWatchSource::new(&window_rules_context) {
             Ok(source) => {
@@ -317,6 +320,13 @@ impl Config {
                                 state.common.config.tiling_exceptions = new_exceptions;
                                 state.common.shell.write().update_tiling_exceptions(
                                     state.common.config.tiling_exceptions.iter(),
+                                );
+                            }
+                            "hint_exception_custom" => {
+                                let new_exceptions = window_rules::hint_exceptions(&config);
+                                state.common.config.hint_exceptions = new_exceptions;
+                                state.common.shell.write().update_hint_exceptions(
+                                    state.common.config.hint_exceptions.iter(),
                                 );
                             }
                             _ => (),
@@ -383,6 +393,7 @@ impl Config {
             shortcuts,
             system_actions,
             tiling_exceptions,
+            hint_exceptions,
         }
     }
 

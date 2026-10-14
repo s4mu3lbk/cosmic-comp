@@ -312,6 +312,7 @@ pub struct Shell {
     zoom_state: Option<ZoomState>,
     appearance_conf: AppearanceConfig,
     tiling_exceptions: TilingExceptions,
+    pub hint_exceptions: TilingExceptions,
     pending_focus_overrides: Vec<PendingFocusOverride>,
 
     #[cfg(feature = "debug")]
@@ -1745,6 +1746,7 @@ impl Shell {
         let theme = cosmic::theme::system_preference();
 
         let tiling_exceptions = layout::TilingExceptions::new(config.tiling_exceptions.iter());
+        let hint_exceptions = layout::TilingExceptions::new(config.hint_exceptions.iter());
 
         Shell {
             workspaces: Workspaces::new(config, theme.clone()),
@@ -1768,6 +1770,7 @@ impl Shell {
             appearance_conf: config.cosmic_conf.appearance_settings,
             zoom_state: None,
             tiling_exceptions,
+            hint_exceptions,
             pending_focus_overrides: Vec::new(),
 
             #[cfg(feature = "debug")]
@@ -4036,7 +4039,9 @@ impl Shell {
             GrabStartData::Touch(start_data) => Trigger::Touch(start_data.slot),
             GrabStartData::TabletTool { tool, data } => Trigger::Tool(tool.clone(), data.trigger),
         };
-        let active_hint = if config.cosmic_conf.active_hint {
+        let active_hint = if config.cosmic_conf.active_hint
+            && !layout::has_floating_exception(&self.hint_exceptions, &mapped.active_window())
+        {
             self.theme.cosmic().active_hint as u8
         } else {
             0
@@ -5278,6 +5283,13 @@ impl Shell {
         I: Iterator<Item = &'a ApplicationException>,
     {
         self.tiling_exceptions = layout::TilingExceptions::new(exceptions);
+    }
+
+    pub fn update_hint_exceptions<'a, I>(&mut self, exceptions: I)
+    where
+        I: Iterator<Item = &'a ApplicationException>,
+    {
+        self.hint_exceptions = layout::TilingExceptions::new(exceptions);
     }
 
     pub fn take_presentation_feedback(

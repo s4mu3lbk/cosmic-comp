@@ -32,7 +32,7 @@ use crate::{
         element::CosmicMappedKey,
         focus::{FocusTarget, Stage, render_input_order, target::WindowGroup},
         grabs::{SeatMenuGrabState, SeatMoveGrabState},
-        layout::tiling::ANIMATION_DURATION,
+        layout::{has_floating_exception, tiling::ANIMATION_DURATION},
         zoom::ZoomState,
     },
     utils::{prelude::*, quirks::workspace_overview_is_open},
@@ -802,6 +802,22 @@ where
         theme.cosmic().active_hint as u8
     } else {
         0
+    };
+    let active_hint = if active_hint > 0
+        && workspace
+            .focus_stack
+            .get(last_active_seat)
+            .last()
+            .and_then(|target| match target {
+                FocusTarget::Window(mapped) => Some(mapped),
+                _ => None,
+            })
+            .is_some_and(|mapped| {
+                has_floating_exception(&shell.hint_exceptions, &mapped.active_window())
+            }) {
+        0
+    } else {
+        active_hint
     };
 
     let output_size = output
